@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python build/test cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local env
+.env
+
+# Training artifacts/cache (keep if you intentionally version them)
+delivery_learning_models/transcripts_cache.json
+
+# Local training dataset audio
+voice/
