@@ -21,6 +21,12 @@ class VoiceAnalyzeRequest(BaseModel):
     feedback_id: int = Field(..., ge=1)
 
 
+class VoiceAnalyzeByFeedbackRequest(BaseModel):
+    # 다른 서버에서 user_id를 몰라도 feedback_id만으로 호출할 수 있게 합니다.
+    feedback_id: int = Field(..., ge=1)
+    user_id: int | None = Field(default=None, ge=1)
+
+
 def _check_internal_secret(x_secret: str | None) -> None:
     expected = settings.INTERNAL_API_SECRET
     if not expected:
@@ -51,6 +57,26 @@ def health():
 @app.post("/api/v1/voice/analyze")
 def voice_analyze(
     body: VoiceAnalyzeRequest,
+    x_delivery_learning_secret: str | None = Header(default=None, alias="X-Delivery-Learning-Secret"),
+):
+    _check_internal_secret(x_delivery_learning_secret)
+    try:
+        return run_feedback_voice_analysis(body.user_id, body.feedback_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=f"오디오 파일 오류: {e}") from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"분석 중 오류: {e!s}") from e
+
+
+@app.post("/api/v1/voice/analyze-by-feedback")
+def voice_analyze_by_feedback(
+    body: VoiceAnalyzeByFeedbackRequest,
     x_delivery_learning_secret: str | None = Header(default=None, alias="X-Delivery-Learning-Secret"),
 ):
     _check_internal_secret(x_delivery_learning_secret)

@@ -67,6 +67,26 @@ def _feedback_owned_by_user(conn: Connection, feedback_id: int, user_id: int) ->
     return row is not None
 
 
+def _get_feedback_owner_user_id(conn: Connection, feedback_id: int) -> int | None:
+    row = conn.execute(
+        text(
+            """
+            SELECT user_id
+            FROM [Feedback]
+            WHERE id = :feedback_id
+            """
+        ),
+        {"feedback_id": feedback_id},
+    ).fetchone()
+    if row is None:
+        return None
+    # SQLAlchemy row: access by column name
+    owner = row.user_id if hasattr(row, "user_id") else row[0]
+    if owner is None:
+        return None
+    return int(owner)
+
+
 def _list_audio_rows(conn: Connection, feedback_id: int) -> list[Any]:
     return list(
         conn.execute(
@@ -77,6 +97,10 @@ def _list_audio_rows(conn: Connection, feedback_id: int) -> list[Any]:
                 WHERE feedback_id = :feedback_id
                   AND audio_key IS NOT NULL
                   AND LTRIM(RTRIM(audio_key)) <> ''
+                  AND (
+                        transcript_text IS NULL
+                        OR LTRIM(RTRIM(transcript_text)) = ''
+                      )
                 ORDER BY slide_index
                 """
             ),
@@ -130,7 +154,7 @@ def _update_audio_analysis_row(
     )
 
 
-def run_feedback_voice_analysis(user_id: int, feedback_id: int) -> dict[str, Any]:
+def run_feedback_voice_analysis(user_id: int | None, feedback_id: int) -> dict[str, Any]:
     """
     Raises:
         PermissionError: 본인 feedback 이 아님
@@ -146,12 +170,27 @@ def run_feedback_voice_analysis(user_id: int, feedback_id: int) -> dict[str, Any
     engine = create_engine(settings.db_connection_string, fast_executemany=True)
 
     with engine.begin() as conn:
-        if not _feedback_owned_by_user(conn, feedback_id, user_id):
+        # 다른 서버에서 user_id를 몰라도 feedback_id만으로 호출할 수 있게,
+        # 필요하면 DB에서 owner user_id를 조회합니다.
+        effective_user_id = user_id
+        if effective_user_id is None:
+            owner = _get_feedback_owner_user_id(conn, feedback_id)
+            if owner is None:
+                raise ValueError(f"feedback_id={feedback_id} 에 해당하는 데이터를 찾을 수 없습니다.")
+            effective_user_id = owner
+
+        if not _feedback_owned_by_user(conn, feedback_id, effective_user_id):
             raise PermissionError("해당 피드백에 대한 접근 권한이 없습니다.")
 
         rows = _list_audio_rows(conn, feedback_id)
         if not rows:
-            raise ValueError("분석할 Audio_analysis 행이 없습니다. 먼저 오디오 업로드 URL을 발급받았는지 확인하세요.")
+            # 이미 transcript_text가 채워진 경우도 많으므로, "없음"은 조용히 통과합니다.
+            return {
+                "feedback_id": feedback_id,
+                "user_id": effective_user_id,
+                "slides_processed": 0,
+                "slides": [],
+            }
 
         slide_results: list[dict[str, Any]] = []
 
@@ -190,7 +229,7 @@ def run_feedback_voice_analysis(user_id: int, feedback_id: int) -> dict[str, Any
 
     return {
         "feedback_id": feedback_id,
-        "user_id": user_id,
+        "user_id": effective_user_id,
         "slides_processed": len(slide_results),
         "slides": slide_results,
     }
