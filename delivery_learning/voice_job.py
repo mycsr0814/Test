@@ -30,8 +30,6 @@ def resolve_model_dir() -> str:
 
 
 def _require_voice_api_config() -> None:
-    if not settings.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY 가 필요합니다.")
     if not (settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY and settings.S3_BUCKET_NAME):
         raise RuntimeError("S3 다운로드를 위해 AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME 가 필요합니다.")
 

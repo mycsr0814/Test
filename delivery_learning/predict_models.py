@@ -5,6 +5,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from delivery_learning.config import settings
+from delivery_learning.consts import DEFAULT_FILLER_HIGH_RATIO
 from delivery_learning.features import analyze_transcript_for_features, build_feature_vector
 from delivery_learning.ml_models import TrainedModelBundle, predict_speed_and_filler
 
@@ -55,12 +56,64 @@ def _openai_verbose_transcribe(
     return transcript_text, duration_sec, model
 
 
+def _local_whisper_transcribe(
+    audio_path: Path,
+    local_model_name: str | None = None,
+) -> tuple[str, float | None, str]:
+    import whisper
+
+    model_name = local_model_name or os.environ.get("LOCAL_WHISPER_MODEL", "base")
+    model = whisper.load_model(model_name)
+    result = model.transcribe(str(audio_path), verbose=False)
+
+    transcript_text = (result.get("text") or "").strip()
+    duration_sec = None
+    segments = result.get("segments") or []
+    if isinstance(segments, list) and segments:
+        ends: list[float] = []
+        for s in segments:
+            if isinstance(s, dict):
+                end = s.get("end")
+                if isinstance(end, (int, float)):
+                    ends.append(float(end))
+        if ends:
+            duration_sec = max(ends)
+
+    return transcript_text, duration_sec, f"local-whisper:{model_name}"
+
+
+def _resolve_stt_backend(openai_api_key: str | None) -> str:
+    """
+    STT_BACKEND:
+    - openai: OpenAI Whisper API 강제
+    - local: 로컬 Whisper 강제
+    - auto(기본): OPENAI_API_KEY 있으면 openai, 없으면 local
+    """
+    backend = (os.environ.get("STT_BACKEND", "auto") or "auto").strip().lower()
+    if backend not in {"auto", "openai", "local"}:
+        backend = "auto"
+    if backend == "auto":
+        return "openai" if (openai_api_key or settings.OPENAI_API_KEY) else "local"
+    return backend
+
+
 def _filler_tokens_json(filler_token_counts: dict[str, int]) -> str:
     items = [
         {"word": k, "count": int(v)}
         for k, v in sorted(filler_token_counts.items(), key=lambda x: x[1], reverse=True)
     ]
     return json.dumps(items, ensure_ascii=False)
+
+
+def _stabilize_filler_label(pred: dict, filler_ratio: float) -> str:
+    """
+    모델 예측이 과민하게 '많음'으로 치우치는 것을 방지하기 위한 후처리.
+    필러 비율이 임계치보다 낮으면 '보통'으로 보정합니다.
+    """
+    label = str(pred.get("filler_label", "보통"))
+    if filler_ratio < DEFAULT_FILLER_HIGH_RATIO:
+        return "보통"
+    return label
 
 
 def transcribe_then_label_with_bundle(
@@ -77,9 +130,16 @@ def transcribe_then_label_with_bundle(
     if not audio_path.exists():
         raise FileNotFoundError(str(audio_path))
 
-    transcript_text, duration_sec, whisper_model = _openai_verbose_transcribe(
-        audio_path, transcribe_model, openai_api_key
-    )
+    backend = _resolve_stt_backend(openai_api_key)
+    if backend == "openai":
+        transcript_text, duration_sec, whisper_model = _openai_verbose_transcribe(
+            audio_path, transcribe_model, openai_api_key
+        )
+    else:
+        transcript_text, duration_sec, whisper_model = _local_whisper_transcribe(
+            audio_path,
+            local_model_name=transcribe_model,
+        )
     stats = analyze_transcript_for_features(transcript_text, duration_sec)
     feature_row = build_feature_vector(transcript_text, duration_sec)
     pred = predict_speed_and_filler(bundle=bundle, feature_row=feature_row)
@@ -94,7 +154,7 @@ def transcribe_then_label_with_bundle(
         "filler_ratio": stats.filler_ratio,
         "filler_tokens_json": _filler_tokens_json(stats.filler_token_counts),
         "speed_label": pred["speed_label"],
-        "filler_label": pred["filler_label"],
+        "filler_label": _stabilize_filler_label(pred, stats.filler_ratio),
     }
 
 
