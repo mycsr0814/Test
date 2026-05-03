@@ -8,6 +8,7 @@ from delivery_learning.config import settings
 from delivery_learning.consts import DEFAULT_FILLER_HIGH_RATIO
 from delivery_learning.features import analyze_transcript_for_features, build_feature_vector
 from delivery_learning.ml_models import TrainedModelBundle, predict_speed_and_filler
+from delivery_learning.stt_durations import resolve_duration_for_metrics
 
 
 def predict_labels_from_transcript(
@@ -41,17 +42,9 @@ def _openai_verbose_transcribe(
     res_dict = res if isinstance(res, dict) else getattr(res, "__dict__", {})
     transcript_text = res_dict.get("text") or getattr(res, "text", "") or ""
 
-    duration_sec = None
     segments = res_dict.get("segments") or getattr(res, "segments", None)
-    if isinstance(segments, list) and segments:
-        ends: list[float] = []
-        for s in segments:
-            if isinstance(s, dict):
-                end = s.get("end")
-                if isinstance(end, (int, float)):
-                    ends.append(float(end))
-        if ends:
-            duration_sec = max(ends)
+    segments_list = segments if isinstance(segments, list) else None
+    duration_sec = resolve_duration_for_metrics(segments_list, audio_path)
 
     return transcript_text, duration_sec, model
 
@@ -67,17 +60,9 @@ def _local_whisper_transcribe(
     result = model.transcribe(str(audio_path), verbose=False)
 
     transcript_text = (result.get("text") or "").strip()
-    duration_sec = None
     segments = result.get("segments") or []
-    if isinstance(segments, list) and segments:
-        ends: list[float] = []
-        for s in segments:
-            if isinstance(s, dict):
-                end = s.get("end")
-                if isinstance(end, (int, float)):
-                    ends.append(float(end))
-        if ends:
-            duration_sec = max(ends)
+    segments_list = segments if isinstance(segments, list) else None
+    duration_sec = resolve_duration_for_metrics(segments_list, audio_path)
 
     return transcript_text, duration_sec, f"local-whisper:{model_name}"
 

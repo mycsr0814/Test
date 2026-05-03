@@ -5,9 +5,14 @@ import os
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+
 from delivery_learning.config import settings
 from delivery_learning.features import build_feature_vector
-from delivery_learning.ml_models import train_speed_and_filler_models
+from delivery_learning.ml_models import _to_matrix, train_speed_and_filler_models
+from delivery_learning.stt_durations import resolve_duration_for_metrics
 
 
 def _iter_voice_samples(voice_dir: Path, label_csv: Path | None) -> Iterable[tuple[Path, str, str]]:
@@ -52,7 +57,7 @@ def _iter_voice_samples(voice_dir: Path, label_csv: Path | None) -> Iterable[tup
 def transcribe_audio_openai(audio_path: Path, model: str) -> tuple[str, float | None]:
     """
     OpenAI Whisper STT:
-    오디오 -> transcript_text + duration_sec(segments end 기반 추정)
+    오디오 -> transcript_text + duration_sec(세그먼트 발화 합·ffprobe 등, predict_models와 동일 규칙)
     """
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY가 필요합니다(동작: stt-backend=openai).")
@@ -72,16 +77,8 @@ def transcribe_audio_openai(audio_path: Path, model: str) -> tuple[str, float | 
     transcript_text = (transcript_text or getattr(res, "text", "")).strip()  # type: ignore[attr-defined]
 
     segments = res_dict.get("segments") or getattr(res, "segments", None)  # type: ignore[attr-defined]
-    duration_sec = None
-    if isinstance(segments, list) and segments:
-        ends: list[float] = []
-        for s in segments:
-            if isinstance(s, dict):
-                end = s.get("end")
-                if isinstance(end, (int, float)):
-                    ends.append(float(end))
-        if ends:
-            duration_sec = max(ends)
+    segments_list = segments if isinstance(segments, list) else None
+    duration_sec = resolve_duration_for_metrics(segments_list, audio_path)
 
     return transcript_text, duration_sec
 
@@ -89,7 +86,7 @@ def transcribe_audio_openai(audio_path: Path, model: str) -> tuple[str, float | 
 def transcribe_audio_local(audio_path: Path, model_name: str) -> tuple[str, float | None]:
     """
     로컬 Whisper STT:
-    오디오 -> transcript_text + duration_sec(segments end 기반 추정)
+    오디오 -> transcript_text + duration_sec(세그먼트 발화 합·ffprobe 등)
     """
     import whisper
 
@@ -98,19 +95,53 @@ def transcribe_audio_local(audio_path: Path, model_name: str) -> tuple[str, floa
 
     transcript_text = (result.get("text") or "").strip()
     segments = result.get("segments") or []
-
-    duration_sec = None
-    if isinstance(segments, list) and segments:
-        ends: list[float] = []
-        for s in segments:
-            if isinstance(s, dict):
-                end = s.get("end")
-                if isinstance(end, (int, float)):
-                    ends.append(float(end))
-        if ends:
-            duration_sec = max(ends)
+    segments_list = segments if isinstance(segments, list) else None
+    duration_sec = resolve_duration_for_metrics(segments_list, audio_path)
 
     return transcript_text, duration_sec
+
+
+def _safe_train_test_split_indices(
+    n_samples: int,
+    test_size: float,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    데이터 인덱스를 train/test로 분리합니다.
+    샘플이 너무 적은 경우를 포함해 항상 최소 1개 이상의 test 샘플을 확보합니다.
+    """
+    indices = np.arange(n_samples)
+    test_count = max(1, int(round(n_samples * test_size)))
+    test_count = min(test_count, n_samples - 1)
+
+    train_idx, test_idx = train_test_split(
+        indices,
+        test_size=test_count,
+        random_state=random_state,
+        shuffle=True,
+    )
+    return np.array(train_idx), np.array(test_idx)
+
+
+def _evaluate_classifier(
+    model,
+    x_train,
+    y_train: list[str],
+    x_test,
+    y_test: list[str],
+    title: str,
+) -> None:
+    train_pred = model.predict(x_train)
+    test_pred = model.predict(x_test)
+
+    train_acc = accuracy_score(y_train, train_pred)
+    test_acc = accuracy_score(y_test, test_pred)
+
+    print(f"\n[{title}]")
+    print(f"- Train Accuracy: {train_acc:.4f}")
+    print(f"- Test Accuracy : {test_acc:.4f}")
+    print("- Test Classification Report:")
+    print(classification_report(y_test, test_pred, digits=4, zero_division=0))
 
 
 def main():
@@ -121,6 +152,8 @@ def main():
     parser.add_argument("--stt-backend", default="local", choices=["local", "openai"])
     parser.add_argument("--openai-transcribe-model", default=os.environ.get("TRANSCRIBE_MODEL", "whisper-1"))
     parser.add_argument("--local-whisper-model", default=os.environ.get("LOCAL_WHISPER_MODEL", "base"))
+    parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument("--random-state", type=int, default=42)
     args = parser.parse_args()
 
     voice_dir = Path(args.voice_dir).resolve()
@@ -144,6 +177,10 @@ def main():
     samples = list(_iter_voice_samples(voice_dir, label_csv if label_csv.exists() else None))
     if not samples:
         raise RuntimeError(f"학습 데이터가 없습니다. voice_dir={voice_dir}, label_csv={label_csv}")
+    if len(samples) < 2:
+        raise RuntimeError("평가를 위해 최소 2개 이상의 샘플이 필요합니다.")
+    if not (0.0 < args.test_size < 0.9):
+        raise ValueError("--test-size는 0보다 크고 0.9보다 작은 값이어야 합니다.")
 
     stt_tag = f"stt={args.stt_backend}"
     for audio_path, speed_label, filler_label in samples:
@@ -171,12 +208,52 @@ def main():
         speed_labels.append(speed_label)
         filler_labels.append(filler_label)
 
+    train_idx, test_idx = _safe_train_test_split_indices(
+        n_samples=len(feature_rows),
+        test_size=args.test_size,
+        random_state=args.random_state,
+    )
+
+    train_features = [feature_rows[int(i)] for i in train_idx]
+    train_speed_labels = [speed_labels[int(i)] for i in train_idx]
+    train_filler_labels = [filler_labels[int(i)] for i in train_idx]
+
     bundle = train_speed_and_filler_models(
-        feature_rows=feature_rows,
-        speed_labels=speed_labels,
-        filler_labels=filler_labels,
+        feature_rows=train_features,
+        speed_labels=train_speed_labels,
+        filler_labels=train_filler_labels,
     )
     bundle.save(str(model_dir))
+
+    x_all = _to_matrix(feature_rows, bundle.feature_order)
+    x_train = x_all[train_idx]
+    x_test = x_all[test_idx]
+    y_speed_train = [speed_labels[int(i)] for i in train_idx]
+    y_speed_test = [speed_labels[int(i)] for i in test_idx]
+    y_filler_train = [filler_labels[int(i)] for i in train_idx]
+    y_filler_test = [filler_labels[int(i)] for i in test_idx]
+
+    print(
+        "평가 데이터 분할: "
+        f"전체={len(feature_rows)}개, 학습={len(train_idx)}개, 테스트={len(test_idx)}개 "
+        f"(test_size={args.test_size}, random_state={args.random_state})"
+    )
+    _evaluate_classifier(
+        model=bundle.speed_model,
+        x_train=x_train,
+        y_train=y_speed_train,
+        x_test=x_test,
+        y_test=y_speed_test,
+        title="Speed Label (느림/보통/빠름)",
+    )
+    _evaluate_classifier(
+        model=bundle.filler_model,
+        x_train=x_train,
+        y_train=y_filler_train,
+        x_test=x_test,
+        y_test=y_filler_test,
+        title="Filler Label (보통/많음)",
+    )
     print(f"모델 학습 완료: {model_dir}")
 
 
